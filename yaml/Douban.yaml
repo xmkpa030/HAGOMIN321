@@ -1,0 +1,53 @@
+gpu_id: 0
+field_separator: "\t"
+source_domain:
+  dataset: DoubanAll_woT
+  USER_ID_FIELD: user_id
+  ITEM_ID_FIELD: item_id
+  RATING_FIELD: rating
+  TIME_FIELD: timestamp
+  NEG_PREFIX: neg_
+  LABEL_FIELD: label
+  load_col:
+    inter: [user_id, item_id, rating, item_type]
+  user_inter_num_interval: "[5,inf)"
+  item_inter_num_interval: "[5,inf)"
+  val_interval:
+    rating: "[3,inf)"
+  drop_filter_field: True
+
+target_domain:
+  dataset: DoubanBook
+  USER_ID_FIELD: user_id
+  ITEM_ID_FIELD: item_id
+  RATING_FIELD: rating
+  TIME_FIELD: timestamp
+  NEG_PREFIX: neg_
+  LABEL_FIELD: label
+  load_col:
+    inter: [user_id, item_id, rating, item_type]
+  user_inter_num_interval: "[5,inf)"
+  item_inter_num_interval: "[5,inf)"
+  val_interval:
+    rating: "[3,inf)"
+  drop_filter_field: True
+
+epochs: 500
+pretrain_batch_size: 1024
+train_batch_size: 4096
+eval_batch_size: 1048576
+valid_metric: NDCG@10
+metrics: ['Recall', 'MRR', 'NDCG', 'Hit']
+pretrain_learning_rate: 0.005
+learning_rate: 0.01
+n_layers: 2
+connect_way: mean
+lambda_source: 0.8
+lambda_target: 0.8
+drop_rate: 0.2
+reg_weight: 0.01
+num_coods: 5
+pretrain_method: "costa"
+reconstruct: 0.2
+save_step: 30
+train_epochs: ["SOURCE:30", "TARGET:300"]
