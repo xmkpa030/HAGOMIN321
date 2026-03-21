@@ -81,6 +81,9 @@ class HAGO(CrossDomainRecommender):
         self.pe = config["pe"] # pe
         self.pf = config["pf"] # pf
         self.tau = config["tau"] # tau
+        # [Target-aware refinement]
+        self.target_aware = config.get('target_aware', False)
+        self.target_aware_weight = config.get('target_aware_weight', 0.1)
 
         
         # define layers and loss
@@ -199,6 +202,32 @@ class HAGO(CrossDomainRecommender):
         SparseL = torch.sparse_coo_tensor(i, data, torch.Size(L.shape))
         return SparseL
     
+    # [Target-aware refinement]
+    def compute_user_target_aware_scores(self, user_ids, coord_start, coord_end):
+        coord_embeddings = F.normalize(self.coord_embedding.weight[coord_start:coord_end], dim=1)
+        source_user_embeddings = F.normalize(self.source_user_embedding(user_ids).detach(), dim=1)
+        base_scores = source_user_embeddings @ coord_embeddings.transpose(0, 1)
+
+        if not self.target_aware:
+            return base_scores
+
+        target_user_embeddings = F.normalize(self.target_user_embedding(user_ids).detach(), dim=1)
+        target_scores = target_user_embeddings @ coord_embeddings.transpose(0, 1)
+        return base_scores + self.target_aware_weight * target_scores
+
+    # [Target-aware refinement]
+    def compute_item_target_aware_scores(self, item_ids, coord_start, coord_end):
+        coord_embeddings = F.normalize(self.coord_embedding.weight[coord_start:coord_end], dim=1)
+        source_item_embeddings = F.normalize(self.source_item_embedding(item_ids).detach(), dim=1)
+        base_scores = source_item_embeddings @ coord_embeddings.transpose(0, 1)
+
+        if not self.target_aware:
+            return base_scores
+
+        target_item_embeddings = F.normalize(self.target_item_embedding(item_ids).detach(), dim=1)
+        target_scores = target_item_embeddings @ coord_embeddings.transpose(0, 1)
+        return base_scores + self.target_aware_weight * target_scores
+
     def get_norm_adj_mat_with_cood(self, interaction_matrix, n_users=None, n_items=None):
         interaction_matrix = interaction_matrix.tocoo()
         # build adj matrix
@@ -244,11 +273,18 @@ class HAGO(CrossDomainRecommender):
                 self.items_domain_list.append(self.dataset.target_domain_dataset.inter_feat["target_item_id"].unique().cuda())
             
 
+            user_coord_start = (i - 1) * self.num_coods
+            user_coord_end = i * self.num_coods
+            item_coord_start = self.num_graphs * self.num_coods + (i - 1) * self.num_coods
+            item_coord_end = self.num_graphs * self.num_coods + i * self.num_coods
+
             self.index_list.append(torch.cartesian_prod(self.users_domain_list[i-1], torch.arange(n_nodes-(2*self.num_graphs-i)*self.num_coods-self.num_coods, n_nodes - (2*self.num_graphs-i)*self.num_coods).cuda()).T)
-            self.value_list.append((F.normalize(self.source_user_embedding(self.users_domain_list[i-1]).detach())@F.normalize(self.coord_embedding.weight).T[:, (i-1)*self.num_coods:i*self.num_coods]).flatten())
+            # [Target-aware refinement]
+            self.value_list.append(self.compute_user_target_aware_scores(self.users_domain_list[i-1], user_coord_start, user_coord_end).flatten())
             
             self.index_list.append(torch.cartesian_prod(self.items_domain_list[i-1], torch.arange(n_nodes-(self.num_graphs-i)*self.num_coods-self.num_coods, n_nodes - (self.num_graphs-i)*self.num_coods).cuda()).T)
-            self.value_list.append((F.normalize(self.source_item_embedding(self.items_domain_list[i-1]).detach())@F.normalize(self.coord_embedding.weight).T[:, self.num_graphs*self.num_coods+(i-1)*self.num_coods:self.num_graphs*self.num_coods+i*self.num_coods]).flatten())
+            # [Target-aware refinement]
+            self.value_list.append(self.compute_item_target_aware_scores(self.items_domain_list[i-1], item_coord_start, item_coord_end).flatten())
 
         index_list = torch.cat(self.index_list, dim=1)
         value_list = torch.cat(self.value_list)
@@ -266,10 +302,16 @@ class HAGO(CrossDomainRecommender):
         n_nodes = n_users + n_items+ n_coods
         self.value_list = []
         for i in range(1, self.num_graphs+1):
+            user_coord_start = (i - 1) * self.num_coods
+            user_coord_end = i * self.num_coods
+            item_coord_start = (i - 1) * self.num_coods
+            item_coord_end = i * self.num_coods
 
-            self.value_list.append((F.normalize(self.source_user_embedding(self.users_domain_list[i-1]).detach())@F.normalize(self.coord_embedding.weight).T[:, (i-1)*self.num_coods:i*self.num_coods]).flatten())
+            # [Target-aware refinement]
+            self.value_list.append(self.compute_user_target_aware_scores(self.users_domain_list[i-1], user_coord_start, user_coord_end).flatten())
 
-            self.value_list.append((F.normalize(self.source_item_embedding(self.items_domain_list[i-1]).detach())@F.normalize(self.coord_embedding.weight).T[:, (i-1)*self.num_coods:i*self.num_coods]).flatten())
+            # [Target-aware refinement]
+            self.value_list.append(self.compute_item_target_aware_scores(self.items_domain_list[i-1], item_coord_start, item_coord_end).flatten())
 
         index_list = torch.cat(self.index_list, dim=1)
         value_list = torch.cat(self.value_list)
