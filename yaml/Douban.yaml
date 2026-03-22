@@ -47,6 +47,11 @@ lambda_target: 0.8
 drop_rate: 0.2
 reg_weight: 0.01
 num_coods: 5
+long_short_aware: False
+short_window: 5
+lambda_orig: 1.0
+lambda_long: 0.5
+lambda_short: 0.5
 pretrain_method: "costa"
 reconstruct: 0.2
 save_step: 30

@@ -81,6 +81,11 @@ class HAGO(CrossDomainRecommender):
         self.pe = config["pe"] # pe
         self.pf = config["pf"] # pf
         self.tau = config["tau"] # tau
+        self.long_short_aware = config['long_short_aware'] if 'long_short_aware' in config else False
+        self.short_window = max(1, int(config['short_window'] if 'short_window' in config else 5))
+        self.lambda_orig = config['lambda_orig'] if 'lambda_orig' in config else 1.0
+        self.lambda_long = config['lambda_long'] if 'lambda_long' in config else 0.5
+        self.lambda_short = config['lambda_short'] if 'lambda_short' in config else 0.5
 
         
         # define layers and loss
@@ -118,6 +123,7 @@ class HAGO(CrossDomainRecommender):
                                                        self.total_num_items).to(self.device)
         self.target_norm_adj_matrix = self.get_norm_adj_mat(self.target_interaction_matrix, self.total_num_users,
                                                        self.total_num_items, domain="target").to(self.device)
+        self.build_user_history_cache()
         
         self.source_norm_adj_matrix_with_cood = self.get_norm_adj_mat_with_cood(self.source_interaction_matrix+self.target_interaction_matrix, self.total_num_users, self.total_num_items).to(self.device)
         
@@ -199,6 +205,80 @@ class HAGO(CrossDomainRecommender):
         SparseL = torch.sparse_coo_tensor(i, data, torch.Size(L.shape))
         return SparseL
     
+
+    def build_user_history_cache(self):
+        # [Long-short aware connection]
+        source_inter_feat = self.dataset.source_domain_dataset.inter_feat
+        user_field = self.dataset.source_domain_dataset.uid_field
+        item_field = self.dataset.source_domain_dataset.iid_field
+        time_field = self.dataset.source_domain_dataset.time_field
+
+        self.user_history_cache = {}
+        self.user_recent_history_cache = {}
+
+        user_ids = source_inter_feat[user_field].numpy()
+        item_ids = source_inter_feat[item_field].numpy()
+
+        # [Long-short aware connection]
+        # Prefer timestamp ordering when the source interaction feature keeps a timestamp field.
+        # Otherwise, fall back to the current interaction row order as an approximation of recency.
+        if time_field and time_field in source_inter_feat.columns:
+            order = np.argsort(source_inter_feat[time_field].numpy(), kind='stable')
+        else:
+            order = np.arange(len(source_inter_feat))
+
+        ordered_user_ids = user_ids[order]
+        ordered_item_ids = item_ids[order]
+
+        for user_id, item_id in zip(ordered_user_ids, ordered_item_ids):
+            history = self.user_history_cache.setdefault(int(user_id), [])
+            history.append(int(item_id))
+
+        for user_id, history in self.user_history_cache.items():
+            self.user_recent_history_cache[user_id] = history[-self.short_window:]
+
+    def _mean_history_item_embedding(self, user_ids, history_cache):
+        user_ids = user_ids.to(self.device)
+        item_weight = self.source_item_embedding.weight
+        user_weight = self.source_user_embedding.weight.detach()
+        history_embeddings = []
+
+        for user_id in user_ids.detach().cpu().tolist():
+            item_history = history_cache.get(int(user_id), [])
+            if item_history:
+                item_tensor = torch.tensor(item_history, dtype=torch.long, device=self.device)
+                history_embeddings.append(item_weight[item_tensor].mean(dim=0))
+            else:
+                history_embeddings.append(user_weight[user_id])
+
+        return torch.stack(history_embeddings, dim=0)
+
+    def compute_long_term_user_embedding(self, user_ids):
+        # [Long-short aware connection]
+        return self._mean_history_item_embedding(user_ids, self.user_history_cache)
+
+    def compute_short_term_user_embedding(self, user_ids):
+        # [Long-short aware connection]
+        return self._mean_history_item_embedding(user_ids, self.user_recent_history_cache)
+
+    def compute_long_short_user_coord_scores(self, user_ids, coord_emb_slice):
+        # [Long-short aware connection]
+        original_score = F.normalize(self.source_user_embedding(user_ids).detach(), dim=1) @ F.normalize(coord_emb_slice, dim=1).T
+        if not self.long_short_aware:
+            return original_score
+
+        long_term_user_embedding = self.compute_long_term_user_embedding(user_ids)
+        short_term_user_embedding = self.compute_short_term_user_embedding(user_ids)
+
+        long_term_score = F.normalize(long_term_user_embedding, dim=1) @ F.normalize(coord_emb_slice, dim=1).T
+        short_term_score = F.normalize(short_term_user_embedding, dim=1) @ F.normalize(coord_emb_slice, dim=1).T
+
+        return (
+            self.lambda_orig * original_score
+            + self.lambda_long * long_term_score
+            + self.lambda_short * short_term_score
+        )
+
     def get_norm_adj_mat_with_cood(self, interaction_matrix, n_users=None, n_items=None):
         interaction_matrix = interaction_matrix.tocoo()
         # build adj matrix
@@ -228,7 +308,7 @@ class HAGO(CrossDomainRecommender):
         col = A.col
         i = torch.LongTensor(np.array([row, col]))
         data = torch.FloatTensor(A.data)
-        self.SparseL = torch.sparse_coo_tensor(i, data, torch.Size(A.shape)).cuda()
+        self.SparseL = torch.sparse_coo_tensor(i, data, torch.Size(A.shape)).to(self.device)
         
         self.users_domain_list = []
         self.items_domain_list = []
@@ -237,17 +317,18 @@ class HAGO(CrossDomainRecommender):
         
         for i in range(1, self.num_graphs+1):
             if i < self.num_graphs:
-                self.users_domain_list.append(self.dataset.source_domain_dataset.inter_feat["source_user_id"][self.dataset.source_domain_dataset.inter_feat["source_item_type"]==i].unique().cuda())
-                self.items_domain_list.append(self.dataset.source_domain_dataset.inter_feat["source_item_id"][self.dataset.source_domain_dataset.inter_feat["source_item_type"]==i].unique().cuda())
+                self.users_domain_list.append(self.dataset.source_domain_dataset.inter_feat["source_user_id"][self.dataset.source_domain_dataset.inter_feat["source_item_type"]==i].unique().to(self.device))
+                self.items_domain_list.append(self.dataset.source_domain_dataset.inter_feat["source_item_id"][self.dataset.source_domain_dataset.inter_feat["source_item_type"]==i].unique().to(self.device))
             else:
-                self.users_domain_list.append(self.dataset.target_domain_dataset.inter_feat["target_user_id"].unique().cuda())
-                self.items_domain_list.append(self.dataset.target_domain_dataset.inter_feat["target_item_id"].unique().cuda())
+                self.users_domain_list.append(self.dataset.target_domain_dataset.inter_feat["target_user_id"].unique().to(self.device))
+                self.items_domain_list.append(self.dataset.target_domain_dataset.inter_feat["target_item_id"].unique().to(self.device))
             
 
-            self.index_list.append(torch.cartesian_prod(self.users_domain_list[i-1], torch.arange(n_nodes-(2*self.num_graphs-i)*self.num_coods-self.num_coods, n_nodes - (2*self.num_graphs-i)*self.num_coods).cuda()).T)
-            self.value_list.append((F.normalize(self.source_user_embedding(self.users_domain_list[i-1]).detach())@F.normalize(self.coord_embedding.weight).T[:, (i-1)*self.num_coods:i*self.num_coods]).flatten())
+            self.index_list.append(torch.cartesian_prod(self.users_domain_list[i-1], torch.arange(n_nodes-(2*self.num_graphs-i)*self.num_coods-self.num_coods, n_nodes - (2*self.num_graphs-i)*self.num_coods, device=self.device)).T)
+            coord_emb_slice = self.coord_embedding.weight[(i-1)*self.num_coods:i*self.num_coods]
+            self.value_list.append(self.compute_long_short_user_coord_scores(self.users_domain_list[i-1], coord_emb_slice).flatten())
             
-            self.index_list.append(torch.cartesian_prod(self.items_domain_list[i-1], torch.arange(n_nodes-(self.num_graphs-i)*self.num_coods-self.num_coods, n_nodes - (self.num_graphs-i)*self.num_coods).cuda()).T)
+            self.index_list.append(torch.cartesian_prod(self.items_domain_list[i-1], torch.arange(n_nodes-(self.num_graphs-i)*self.num_coods-self.num_coods, n_nodes - (self.num_graphs-i)*self.num_coods, device=self.device)).T)
             self.value_list.append((F.normalize(self.source_item_embedding(self.items_domain_list[i-1]).detach())@F.normalize(self.coord_embedding.weight).T[:, self.num_graphs*self.num_coods+(i-1)*self.num_coods:self.num_graphs*self.num_coods+i*self.num_coods]).flatten())
 
         index_list = torch.cat(self.index_list, dim=1)
@@ -267,7 +348,8 @@ class HAGO(CrossDomainRecommender):
         self.value_list = []
         for i in range(1, self.num_graphs+1):
 
-            self.value_list.append((F.normalize(self.source_user_embedding(self.users_domain_list[i-1]).detach())@F.normalize(self.coord_embedding.weight).T[:, (i-1)*self.num_coods:i*self.num_coods]).flatten())
+            coord_emb_slice = self.coord_embedding.weight[(i-1)*self.num_coods:i*self.num_coods]
+            self.value_list.append(self.compute_long_short_user_coord_scores(self.users_domain_list[i-1], coord_emb_slice).flatten())
 
             self.value_list.append((F.normalize(self.source_item_embedding(self.items_domain_list[i-1]).detach())@F.normalize(self.coord_embedding.weight).T[:, (i-1)*self.num_coods:i*self.num_coods]).flatten())
 
