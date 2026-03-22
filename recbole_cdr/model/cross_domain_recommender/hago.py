@@ -81,6 +81,11 @@ class HAGO(CrossDomainRecommender):
         self.pe = config["pe"] # pe
         self.pf = config["pf"] # pf
         self.tau = config["tau"] # tau
+        self.long_short_aware = config.get('long_short_aware', False)
+        self.short_window = config.get('short_window', 5)
+        self.lambda_orig = config.get('lambda_orig', 1.0)
+        self.lambda_long = config.get('lambda_long', 0.5)
+        self.lambda_short = config.get('lambda_short', 0.5)
 
         
         # define layers and loss
@@ -113,6 +118,7 @@ class HAGO(CrossDomainRecommender):
         # generate intermediate data
         self.source_interaction_matrix = dataset.inter_matrix(form='coo', value_field=None, domain='source').astype(np.float32)
         self.target_interaction_matrix = dataset.inter_matrix(form='coo', value_field=None, domain='target').astype(np.float32)
+        self.build_user_history_cache()
 
         self.source_norm_adj_matrix = self.get_norm_adj_mat(self.source_interaction_matrix, self.total_num_users,
                                                        self.total_num_items).to(self.device)
@@ -199,6 +205,77 @@ class HAGO(CrossDomainRecommender):
         SparseL = torch.sparse_coo_tensor(i, data, torch.Size(L.shape))
         return SparseL
     
+
+    def build_user_history_cache(self):
+        # [Long-short aware connection]
+        # Build source-domain user history once during initialization. If source timestamps are
+        # unavailable in the loaded interaction features, we keep dataset row order as an
+        # approximation of recency for the first version.
+        source_dataset = self.dataset.source_domain_dataset
+        inter_feat = source_dataset.inter_feat
+        user_field = source_dataset.uid_field
+        item_field = source_dataset.iid_field
+        time_field = source_dataset.time_field
+        if time_field is not None and time_field not in inter_feat:
+            time_field = None
+
+        user_ids = inter_feat[user_field].numpy()
+        item_ids = inter_feat[item_field].numpy()
+        if time_field is not None:
+            order_values = inter_feat[time_field].numpy()
+        else:
+            order_values = np.arange(len(user_ids))
+
+        history = {}
+        for idx, (user_id, item_id, order_value) in enumerate(zip(user_ids, item_ids, order_values)):
+            history.setdefault(int(user_id), []).append((float(order_value), idx, int(item_id)))
+
+        self.user_history_cache = {}
+        self.user_recent_history_cache = {}
+        for user_id, entries in history.items():
+            entries.sort(key=lambda x: (x[0], x[1]))
+            ordered_items = [item_id for _, _, item_id in entries]
+            self.user_history_cache[user_id] = ordered_items
+            self.user_recent_history_cache[user_id] = ordered_items[-self.short_window:]
+
+    def _mean_item_embedding(self, user_ids, history_cache):
+        # [Long-short aware connection]
+        user_ids = user_ids.detach().cpu().tolist()
+        embeddings = []
+        for user_id in user_ids:
+            item_history = history_cache.get(int(user_id), [])
+            if item_history:
+                item_tensor = torch.tensor(item_history, device=self.device, dtype=torch.long)
+                embeddings.append(self.source_item_embedding(item_tensor).mean(dim=0))
+            else:
+                embeddings.append(torch.zeros(self.latent_dim, device=self.device))
+        return torch.stack(embeddings, dim=0)
+
+    def compute_long_term_user_embedding(self, user_ids):
+        # [Long-short aware connection]
+        return self._mean_item_embedding(user_ids, self.user_history_cache)
+
+    def compute_short_term_user_embedding(self, user_ids):
+        # [Long-short aware connection]
+        return self._mean_item_embedding(user_ids, self.user_recent_history_cache)
+
+    def compute_long_short_user_coord_scores(self, user_ids, coord_emb_slice):
+        # [Long-short aware connection]
+        original_user_embedding = self.source_user_embedding(user_ids).detach()
+        coord_emb_slice = coord_emb_slice.detach()
+        original_score = F.normalize(original_user_embedding, dim=-1) @ F.normalize(coord_emb_slice, dim=-1).transpose(0, 1)
+
+        if not self.long_short_aware:
+            return original_score
+
+        long_term_embedding = self.compute_long_term_user_embedding(user_ids)
+        short_term_embedding = self.compute_short_term_user_embedding(user_ids)
+        norm_coord = F.normalize(coord_emb_slice, dim=-1)
+        long_term_score = F.normalize(long_term_embedding, dim=-1) @ norm_coord.transpose(0, 1)
+        short_term_score = F.normalize(short_term_embedding, dim=-1) @ norm_coord.transpose(0, 1)
+
+        return self.lambda_orig * original_score + self.lambda_long * long_term_score + self.lambda_short * short_term_score
+
     def get_norm_adj_mat_with_cood(self, interaction_matrix, n_users=None, n_items=None):
         interaction_matrix = interaction_matrix.tocoo()
         # build adj matrix
@@ -245,7 +322,8 @@ class HAGO(CrossDomainRecommender):
             
 
             self.index_list.append(torch.cartesian_prod(self.users_domain_list[i-1], torch.arange(n_nodes-(2*self.num_graphs-i)*self.num_coods-self.num_coods, n_nodes - (2*self.num_graphs-i)*self.num_coods).cuda()).T)
-            self.value_list.append((F.normalize(self.source_user_embedding(self.users_domain_list[i-1]).detach())@F.normalize(self.coord_embedding.weight).T[:, (i-1)*self.num_coods:i*self.num_coods]).flatten())
+            coord_emb_slice = self.coord_embedding.weight[(i-1)*self.num_coods:i*self.num_coods]
+            self.value_list.append(self.compute_long_short_user_coord_scores(self.users_domain_list[i-1], coord_emb_slice).flatten())
             
             self.index_list.append(torch.cartesian_prod(self.items_domain_list[i-1], torch.arange(n_nodes-(self.num_graphs-i)*self.num_coods-self.num_coods, n_nodes - (self.num_graphs-i)*self.num_coods).cuda()).T)
             self.value_list.append((F.normalize(self.source_item_embedding(self.items_domain_list[i-1]).detach())@F.normalize(self.coord_embedding.weight).T[:, self.num_graphs*self.num_coods+(i-1)*self.num_coods:self.num_graphs*self.num_coods+i*self.num_coods]).flatten())
@@ -267,9 +345,10 @@ class HAGO(CrossDomainRecommender):
         self.value_list = []
         for i in range(1, self.num_graphs+1):
 
-            self.value_list.append((F.normalize(self.source_user_embedding(self.users_domain_list[i-1]).detach())@F.normalize(self.coord_embedding.weight).T[:, (i-1)*self.num_coods:i*self.num_coods]).flatten())
+            coord_emb_slice = self.coord_embedding.weight[(i-1)*self.num_coods:i*self.num_coods]
+            self.value_list.append(self.compute_long_short_user_coord_scores(self.users_domain_list[i-1], coord_emb_slice).flatten())
 
-            self.value_list.append((F.normalize(self.source_item_embedding(self.items_domain_list[i-1]).detach())@F.normalize(self.coord_embedding.weight).T[:, (i-1)*self.num_coods:i*self.num_coods]).flatten())
+            self.value_list.append((F.normalize(self.source_item_embedding(self.items_domain_list[i-1]).detach())@F.normalize(self.coord_embedding.weight).T[:, self.num_graphs*self.num_coods+(i-1)*self.num_coods:self.num_graphs*self.num_coods+i*self.num_coods]).flatten())
 
         index_list = torch.cat(self.index_list, dim=1)
         value_list = torch.cat(self.value_list)
