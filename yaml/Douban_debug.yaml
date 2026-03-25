@@ -1,0 +1,6 @@
+epochs: 2
+pretrain_batch_size: 64
+train_batch_size: 64
+eval_batch_size: 256
+save_step: 1
+train_epochs: ["SOURCE:1", "TARGET:1"]
