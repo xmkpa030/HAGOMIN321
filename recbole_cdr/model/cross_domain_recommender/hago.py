@@ -322,6 +322,39 @@ class HAGO(CrossDomainRecommender):
 
         return self.lambda_orig * original_score + self.lambda_long * long_term_score + self.lambda_short * short_term_score
 
+    def build_weighted_coord_cross_block(self, n_users, n_items):
+        user_coord_num = self.num_graphs * self.num_coods
+        if user_coord_num == 0:
+            empty_index = torch.empty((2, 0), dtype=torch.long, device=self.device)
+            empty_value = torch.empty((0,), dtype=torch.float32, device=self.device)
+            return torch.sparse_coo_tensor(empty_index, empty_value, self.SparseL.shape).coalesce()
+
+        user_coord_emb = self.cached_norm_coord_embedding[:user_coord_num]
+        item_coord_emb = self.cached_norm_coord_embedding[user_coord_num:]
+        cross_weight = torch.relu(user_coord_emb @ item_coord_emb.transpose(0, 1))
+
+        cross_index = cross_weight.nonzero(as_tuple=False)
+        if cross_index.size(0) == 0:
+            empty_index = torch.empty((2, 0), dtype=torch.long, device=self.device)
+            empty_value = torch.empty((0,), dtype=torch.float32, device=self.device)
+            return torch.sparse_coo_tensor(empty_index, empty_value, self.SparseL.shape).coalesce()
+
+        cross_value = cross_weight[cross_index[:, 0], cross_index[:, 1]]
+        user_coord_start = n_users + n_items
+        item_coord_start = user_coord_start + user_coord_num
+
+        row_forward = cross_index[:, 0] + user_coord_start
+        col_forward = cross_index[:, 1] + item_coord_start
+        row_backward = col_forward
+        col_backward = row_forward
+
+        coord_cross_index = torch.stack([
+            torch.cat([row_forward, row_backward]),
+            torch.cat([col_forward, col_backward])
+        ], dim=0)
+        coord_cross_value = torch.cat([cross_value, cross_value], dim=0)
+        return torch.sparse_coo_tensor(coord_cross_index, coord_cross_value, self.SparseL.shape).coalesce()
+
     def get_norm_adj_mat_with_cood(self, interaction_matrix, n_users=None, n_items=None):
         interaction_matrix = interaction_matrix.tocoo()
         # build adj matrix
@@ -340,9 +373,6 @@ class HAGO(CrossDomainRecommender):
             
             
         A._update(data_dict)
-
-        A[-n_coods:-n_coods//2, -n_coods//2:] = 1
-        A[-n_coods//2:, -n_coods:-n_coods//2] = 1
 
         self.A = A.tocsr()
 
@@ -378,8 +408,9 @@ class HAGO(CrossDomainRecommender):
         index_list = torch.cat(self.index_list, dim=1)
         value_list = torch.cat(self.value_list)
         coord_matrix = torch.sparse_coo_tensor(index_list, torch.where(value_list>0, value_list, 0), self.SparseL.shape)
+        coord_cross_block = self.build_weighted_coord_cross_block(n_users, n_items)
             
-        return self.SparseL+coord_matrix+coord_matrix.T
+        return self.SparseL + coord_matrix + coord_matrix.T + coord_cross_block
     
     def update_adj_mat_with_cood(self, interaction_matrix, n_users=None, n_items=None):
         interaction_matrix = interaction_matrix.tocoo()
@@ -401,8 +432,9 @@ class HAGO(CrossDomainRecommender):
         index_list = torch.cat(self.index_list, dim=1)
         value_list = torch.cat(self.value_list)
         coord_matrix = torch.sparse_coo_tensor(index_list, torch.where(value_list>0, value_list, 0), self.SparseL.shape)
+        coord_cross_block = self.build_weighted_coord_cross_block(n_users, n_items)
 
-        return self.SparseL+coord_matrix+coord_matrix.T
+        return self.SparseL + coord_matrix + coord_matrix.T + coord_cross_block
     
     @staticmethod
     def corruption(x, edge_index, edge_weight=None):
@@ -594,5 +626,4 @@ class HAGO(CrossDomainRecommender):
         if self.target_restore_user_e is None or self.target_restore_item_e is None:
             self.target_restore_user_e, self.target_restore_item_e = self.forward()
         return self.target_restore_user_e, self.target_restore_item_e
-
 
