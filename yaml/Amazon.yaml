@@ -9,7 +9,7 @@ source_domain:
   NEG_PREFIX: neg_
   LABEL_FIELD: label
   load_col:
-    inter: [user_id, item_id, rating, item_type]
+    inter: [user_id, item_id, rating, item_type, timestamp]
   user_inter_num_interval: "[10,inf)"
   item_inter_num_interval: "[10,inf)"
   val_interval:
@@ -25,7 +25,7 @@ target_domain:
   NEG_PREFIX: neg_
   LABEL_FIELD: label
   load_col:
-    inter: [user_id, item_id, rating, item_type]
+    inter: [user_id, item_id, rating, item_type, timestamp]
   user_inter_num_interval: "[10,inf)"
   item_inter_num_interval: "[10,inf)"
   val_interval:
