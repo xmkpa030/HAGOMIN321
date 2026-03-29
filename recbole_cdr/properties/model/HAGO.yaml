@@ -10,3 +10,5 @@ reproducibility: True
 pe: 0.3
 pf: 0.1
 tau: 0.1
+time_aware: False
+time_decay_gamma: 1e-7
