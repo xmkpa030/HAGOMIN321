@@ -81,6 +81,8 @@ class HAGO(CrossDomainRecommender):
         self.pe = config["pe"] # pe
         self.pf = config["pf"] # pf
         self.tau = config["tau"] # tau
+        self.time_aware = config["time_aware"]
+        self.time_decay_gamma = config["time_decay_gamma"]
 
         
         # define layers and loss
@@ -111,8 +113,8 @@ class HAGO(CrossDomainRecommender):
         
         
         # generate intermediate data
-        self.source_interaction_matrix = dataset.inter_matrix(form='coo', value_field=None, domain='source').astype(np.float32)
-        self.target_interaction_matrix = dataset.inter_matrix(form='coo', value_field=None, domain='target').astype(np.float32)
+        self.source_interaction_matrix = self._get_time_aware_interaction_matrix(domain='source')
+        self.target_interaction_matrix = self._get_time_aware_interaction_matrix(domain='target')
 
         self.source_norm_adj_matrix = self.get_norm_adj_mat(self.source_interaction_matrix, self.total_num_users,
                                                        self.total_num_items).to(self.device)
@@ -171,25 +173,113 @@ class HAGO(CrossDomainRecommender):
 
         self.other_parameter_name = ['target_restore_user_e', 'target_restore_item_e']
 
-    
+    def _resolve_time_field(self, domain='source'):
+        """Resolve the timestamp field from the prefixed domain interaction feature."""
+        domain_dataset = self.dataset.source_domain_dataset if domain == 'source' else self.dataset.target_domain_dataset
+        inter_feat = domain_dataset.inter_feat
+
+        # Preferred field in RecBole dataset object.
+        if getattr(domain_dataset, "time_field", None) in inter_feat.columns:
+            return domain_dataset.time_field
+
+        # Fallback candidates for custom datasets.
+        candidates = [
+            f"{domain}_timestamp",
+            f"{domain}_time",
+            f"{domain}_source_time",
+            f"{domain}_target_time",
+        ]
+        for field in candidates:
+            if field in inter_feat.columns:
+                return field
+        return None
+
+    def _compute_time_decay_weights(self, user_ids, timestamps):
+        """Compute w_ui_time = exp(-gamma * (t_u_last - t_ui))."""
+        user_last_time = np.full(self.total_num_users, -np.inf, dtype=np.float64)
+        np.maximum.at(user_last_time, user_ids, timestamps)
+        delta_t = user_last_time[user_ids] - timestamps
+        delta_t = np.maximum(delta_t, 0.0)
+        return np.exp(-self.time_decay_gamma * delta_t).astype(np.float32)
+
+    @staticmethod
+    def _to_numpy_array(values, dtype=None):
+        if isinstance(values, torch.Tensor):
+            values = values.detach().cpu().numpy()
+        elif hasattr(values, "to_numpy"):
+            values = values.to_numpy()
+        else:
+            values = np.asarray(values)
+        if dtype is not None:
+            values = values.astype(dtype, copy=False)
+        return values
+
+    @staticmethod
+    def _keep_latest_user_item_interactions(user_ids, item_ids, timestamps):
+        """Keep only the latest timestamp for each (user, item) pair."""
+        if len(user_ids) == 0:
+            return user_ids, item_ids, timestamps
+
+        # Sort by (user, item, timestamp desc), then keep first record per (user, item).
+        order = np.lexsort((-timestamps, item_ids, user_ids))
+        sorted_user_ids = user_ids[order]
+        sorted_item_ids = item_ids[order]
+        sorted_timestamps = timestamps[order]
+
+        keep = np.ones(sorted_user_ids.shape[0], dtype=bool)
+        keep[1:] = (sorted_user_ids[1:] != sorted_user_ids[:-1]) | (sorted_item_ids[1:] != sorted_item_ids[:-1])
+
+        return sorted_user_ids[keep], sorted_item_ids[keep], sorted_timestamps[keep]
+
+    def _get_time_aware_interaction_matrix(self, domain='source'):
+        """Build interaction matrix with optional time-aware edge weights."""
+        if not self.time_aware:
+            return self.dataset.inter_matrix(form='coo', value_field=None, domain=domain).astype(np.float32)
+
+        domain_dataset = self.dataset.source_domain_dataset if domain == 'source' else self.dataset.target_domain_dataset
+        inter_feat = domain_dataset.inter_feat
+        user_field = domain_dataset.uid_field
+        item_field = domain_dataset.iid_field
+        time_field = self._resolve_time_field(domain=domain)
+
+        if time_field is None:
+            self.logger.warning(
+                f"[HAGO] time_aware=True but no time field found for {domain} domain. "
+                f"Fallback to equal edge weights."
+            )
+            return self.dataset.inter_matrix(form='coo', value_field=None, domain=domain).astype(np.float32)
+
+        user_ids = self._to_numpy_array(inter_feat[user_field], dtype=np.int64)
+        item_ids = self._to_numpy_array(inter_feat[item_field], dtype=np.int64)
+        timestamps = self._to_numpy_array(inter_feat[time_field], dtype=np.float64)
+        user_ids, item_ids, timestamps = self._keep_latest_user_item_interactions(user_ids, item_ids, timestamps)
+        weights = self._compute_time_decay_weights(user_ids, timestamps)
+
+        return sp.coo_matrix(
+            (weights, (user_ids, item_ids)),
+            shape=(self.total_num_users, self.total_num_items),
+            dtype=np.float32
+        )
+
     def get_norm_adj_mat(self, interaction_matrix, n_users=None, n_items=None, domain="source"):
         # build adj matrix
         if n_users == None or n_items == None:
             n_users, n_items = interaction_matrix.shape
-        A = sp.dok_matrix((n_users + n_items, n_users + n_items), dtype=np.float32)
-            
-        inter_M = interaction_matrix
-        inter_M_t = interaction_matrix.transpose()
-        data_dict = dict(zip(zip(inter_M.row, inter_M.col + n_users), [1] * inter_M.nnz))
-        data_dict.update(dict(zip(zip(inter_M_t.row + n_users, inter_M_t.col), [1] * inter_M_t.nnz)))
-        A._update(data_dict)
+
+        inter_M = interaction_matrix.tocoo()
+        A = sp.coo_matrix(
+            (inter_M.data, (inter_M.row, inter_M.col + n_users)),
+            shape=(n_users + n_items, n_users + n_items),
+            dtype=np.float32
+        )
+        A = A + A.transpose()
         # norm adj matrix
         sumArr = (A > 0).sum(axis=1)
         # add epsilon to avoid divide by zero Warning
         diag = np.array(sumArr.flatten())[0] + 1e-7
         diag = np.power(diag, -0.5)
         D = sp.diags(diag)
-        L = A 
+        L = A
         # covert norm_adj matrix to tensor
         L = sp.coo_matrix(L)
         row = L.row
@@ -211,12 +301,14 @@ class HAGO(CrossDomainRecommender):
 
         A = sp.dok_matrix((n_users + n_items + n_coods, n_users + n_items + n_coods), dtype=np.float32)
         inter_M = interaction_matrix
-        inter_M_t = interaction_matrix.transpose()
-        data_dict = dict(zip(zip(inter_M.row, inter_M.col + n_users), [1] * inter_M.nnz))
-        data_dict.update(dict(zip(zip(inter_M_t.row + n_users, inter_M_t.col), [1] * inter_M_t.nnz)))
-            
-            
-        A._update(data_dict)
+
+        ui_block = sp.coo_matrix(
+            (inter_M.data, (inter_M.row, inter_M.col + n_users)),
+            shape=(n_users + n_items + n_coods, n_users + n_items + n_coods),
+            dtype=np.float32
+        )
+        ui_block = ui_block + ui_block.transpose()
+        A._update(ui_block.todok())
 
         A[-n_coods:-n_coods//2, -n_coods//2:] = 1
         A[-n_coods//2:, -n_coods:-n_coods//2] = 1
@@ -467,6 +559,3 @@ class HAGO(CrossDomainRecommender):
         if self.target_restore_user_e is None or self.target_restore_item_e is None:
             self.target_restore_user_e, self.target_restore_item_e = self.forward()
         return self.target_restore_user_e, self.target_restore_item_e
-
-
-
