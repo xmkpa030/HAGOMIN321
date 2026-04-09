@@ -75,6 +75,10 @@ class CrossDomainDataloader(AbstractDataLoader):
         self.target_dataloader = TrainDataLoader(config, target_dataset, target_sampler, shuffle=shuffle)
         self.source_dataset = source_dataset
         self.target_dataset = target_dataset
+        self.target_uid_field = target_dataset.uid_field
+        self.target_iid_field = target_dataset.iid_field
+        self.recent_k = int(config['recent_k']) if 'recent_k' in config else 5
+        self._build_target_recent_history()
 
         self.state = CrossDomainDataLoaderState.BOTH
 
@@ -82,6 +86,45 @@ class CrossDomainDataloader(AbstractDataLoader):
         self.dataset.target_domain_dataset = target_dataset
         self.overlap_dataset = self.dataset.overlap_dataset
         self.overlap_dataloader = OverlapDataloader(config, self.overlap_dataset, sampler=None, shuffle=shuffle)
+
+    def _build_target_recent_history(self):
+        self.target_user_history = {}
+        user_ids = self.target_dataset.inter_feat[self.target_uid_field].numpy().tolist()
+        item_ids = self.target_dataset.inter_feat[self.target_iid_field].numpy().tolist()
+        for uid, iid in zip(user_ids, item_ids):
+            uid = int(uid)
+            iid = int(iid)
+            if uid not in self.target_user_history:
+                self.target_user_history[uid] = []
+            self.target_user_history[uid].append(iid)
+
+    def _inject_target_recent_fields(self, target_data):
+        if self.recent_k <= 0:
+            return target_data
+
+        users = target_data[self.target_uid_field]
+        pos_items = target_data[self.target_iid_field]
+        batch_size = len(users)
+
+        recent_items = torch.zeros((batch_size, self.recent_k), dtype=torch.long)
+        recent_len = torch.zeros(batch_size, dtype=torch.long)
+
+        for idx in range(batch_size):
+            uid = int(users[idx])
+            pos_iid = int(pos_items[idx])
+            history = self.target_user_history.get(uid, [])
+            filtered_history = [iid for iid in history if iid != pos_iid]
+            take = filtered_history[-self.recent_k:]
+            cur_len = len(take)
+            if cur_len > 0:
+                recent_items[idx, -cur_len:] = torch.tensor(take, dtype=torch.long)
+                recent_len[idx] = cur_len
+
+        target_data.update(Interaction({
+            'target_recent_items': recent_items,
+            'target_recent_len': recent_len,
+        }))
+        return target_data
 
     def _init_batch_size_and_step(self):
         pass
@@ -148,7 +191,8 @@ class CrossDomainDataloader(AbstractDataLoader):
         if self.state == CrossDomainDataLoaderState.SOURCE:
             return self.source_dataloader.__next__()
         elif self.state == CrossDomainDataLoaderState.TARGET:
-            return self.target_dataloader.__next__()
+            target_data = self.target_dataloader.__next__()
+            return self._inject_target_recent_fields(target_data)
         elif self.state == CrossDomainDataLoaderState.OVERLAP:
             return self.overlap_dataloader.__next__()
         else:
@@ -157,6 +201,7 @@ class CrossDomainDataloader(AbstractDataLoader):
             except StopIteration:
                 source_data = self.source_dataloader.__next__()
             target_data = self.target_dataloader.__next__()
+            target_data = self._inject_target_recent_fields(target_data)
             target_data.update(source_data)
             return target_data
 
