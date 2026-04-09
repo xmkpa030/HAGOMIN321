@@ -81,6 +81,10 @@ class HAGO(CrossDomainRecommender):
         self.pe = config["pe"] # pe
         self.pf = config["pf"] # pf
         self.tau = config["tau"] # tau
+        self.recent_k = int(config['recent_k']) if 'recent_k' in config else 5
+        self.lambda_inc = float(config['lambda_inc']) if 'lambda_inc' in config else 0.0
+        self.recent_hidden_size = int(config['recent_hidden_size']) if 'recent_hidden_size' in config else self.latent_dim
+        self.gate_hidden_size = int(config['gate_hidden_size']) if 'gate_hidden_size' in config else self.latent_dim
 
         
         # define layers and loss
@@ -108,6 +112,16 @@ class HAGO(CrossDomainRecommender):
         self.loss = BPRLoss()
         self.reg_loss = EmbLoss()
         self.project = torch.nn.Sequential(torch.nn.Linear(self.latent_dim, self.latent_dim), torch.nn.ELU(), torch.nn.Linear(self.latent_dim, self.latent_dim))
+        self.recent_encoder = torch.nn.Sequential(
+            torch.nn.Linear(self.latent_dim, self.recent_hidden_size),
+            torch.nn.ReLU(),
+            torch.nn.Linear(self.recent_hidden_size, self.latent_dim)
+        )
+        self.gate_mlp = torch.nn.Sequential(
+            torch.nn.Linear(self.latent_dim * 2, self.gate_hidden_size),
+            torch.nn.ReLU(),
+            torch.nn.Linear(self.gate_hidden_size, self.latent_dim)
+        )
         
         
         # generate intermediate data
@@ -419,11 +433,14 @@ class HAGO(CrossDomainRecommender):
             target_u_embeddings = target_user_all_embeddings[target_user]
             target_pos_embeddings = target_item_all_embeddings[target_pos_item]
             target_neg_embeddings = target_item_all_embeddings[target_neg_item]
+            final_u_embeddings, gate, delta = self.get_recent_enhanced_user(
+                interaction, target_u_embeddings, target_item_all_embeddings
+            )
 
 
             # calculate BPR Loss in target domain
-            pos_scores = torch.mul(target_u_embeddings, target_pos_embeddings).sum(dim=1)
-            neg_scores = torch.mul(target_u_embeddings, target_neg_embeddings).sum(dim=1)
+            pos_scores = torch.mul(final_u_embeddings, target_pos_embeddings).sum(dim=1)
+            neg_scores = torch.mul(final_u_embeddings, target_neg_embeddings).sum(dim=1)
             bpr_loss = self.loss(pos_scores, neg_scores)
 
             # calculate Reg Loss in target domain
@@ -431,8 +448,9 @@ class HAGO(CrossDomainRecommender):
             pos_ego_embeddings = self.target_item_embedding(target_pos_item)
             neg_ego_embeddings = self.target_item_embedding(target_neg_item)
             reg_loss = self.reg_loss(u_ego_embeddings,  pos_ego_embeddings, neg_ego_embeddings)
+            inc_loss = torch.mean(torch.sum(torch.square(gate * delta), dim=1))
 
-            loss = bpr_loss + self.reg_weight * reg_loss
+            loss = bpr_loss + self.reg_weight * reg_loss + self.lambda_inc * inc_loss
 
         return loss
 
@@ -443,6 +461,7 @@ class HAGO(CrossDomainRecommender):
         item = interaction[self.TARGET_ITEM_ID]
 
         u_embeddings = target_user_all_embeddings[user]
+        u_embeddings, _, _ = self.get_recent_enhanced_user(interaction, u_embeddings, target_item_all_embeddings)
         i_embeddings = target_item_all_embeddings[item]
 
         scores = torch.mul(u_embeddings, i_embeddings).sum(dim=1)
@@ -468,5 +487,30 @@ class HAGO(CrossDomainRecommender):
             self.target_restore_user_e, self.target_restore_item_e = self.forward()
         return self.target_restore_user_e, self.target_restore_item_e
 
+    def get_recent_enhanced_user(self, interaction, global_user_embeddings, target_item_all_embeddings):
+        try:
+            recent_items = interaction['target_recent_items']
+        except Exception:
+            zeros = torch.zeros_like(global_user_embeddings)
+            return global_user_embeddings, zeros, zeros
+
+        if recent_items.dim() == 1:
+            recent_items = recent_items.unsqueeze(1)
+
+        recent_item_embeddings = target_item_all_embeddings[recent_items]
+        recent_mask = (recent_items > 0).float().unsqueeze(-1)
+        recent_sum = torch.sum(recent_item_embeddings * recent_mask, dim=1)
+
+        try:
+            recent_len = interaction['target_recent_len'].float().unsqueeze(-1)
+        except Exception:
+            recent_len = torch.sum(recent_mask, dim=1)
+
+        recent_len = torch.clamp(recent_len, min=1.0)
+        recent_context = recent_sum / recent_len
+        delta = self.recent_encoder(recent_context)
+        gate = torch.sigmoid(self.gate_mlp(torch.cat([global_user_embeddings, delta], dim=1)))
+        final_user_embeddings = global_user_embeddings + gate * delta
+        return final_user_embeddings, gate, delta
 
 

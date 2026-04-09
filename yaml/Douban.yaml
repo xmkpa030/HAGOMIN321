@@ -51,3 +51,7 @@ pretrain_method: "costa"
 reconstruct: 0.2
 save_step: 30
 train_epochs: ["SOURCE:30", "TARGET:300"]
+recent_k: 10
+lambda_inc: 0.001
+recent_hidden_size: 64
+gate_hidden_size: 64
